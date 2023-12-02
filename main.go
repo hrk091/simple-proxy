@@ -8,6 +8,8 @@ import (
 	"net/url"
 	"os"
 	"strings"
+
+	"github.com/rs/cors"
 )
 
 func main() {
@@ -21,7 +23,8 @@ func run() error {
 	port := getenv("PORT", "8888")
 	log.Printf("Proxying to %s", target)
 	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-	h := &ProxyHandler{TargetURL: target}
+	c := cors.Default()
+	h := c.Handler(&ProxyHandler{TargetURL: target})
 	return http.ListenAndServe(":"+port, h)
 }
 

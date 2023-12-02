@@ -1,6 +1,9 @@
 FROM golang:1.21 AS build
 WORKDIR /work
 
+COPY go.mod go.sum ./
+RUN go mod download
+
 COPY *.go ./
 ARG GOOS=linux
 ARG GOARCH=amd64
