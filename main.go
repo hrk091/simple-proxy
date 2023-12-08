@@ -1,13 +1,20 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
+	"context"
 	"crypto/tls"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
 	"os"
+	"path"
 	"strings"
+	"time"
 
 	"github.com/rs/cors"
 )
@@ -21,19 +28,108 @@ func main() {
 func run() error {
 	target := mustgetenv("TARGET_URL")
 	port := getenv("PORT", "8888")
+	cacheDir := getenv("CACHE_DIR", "")
+
+	ctx := context.Background()
+	cache := NewLocalCache(cacheDir)
+	cache.Run(ctx)
+
 	log.Printf("Proxying to %s", target)
-	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
+	http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{}
 	c := cors.Default()
-	h := c.Handler(&ProxyHandler{TargetURL: target})
+
+	h := c.Handler(&ProxyHandler{targetURL: target, cache: cache})
 	return http.ListenAndServe(":"+port, h)
 }
 
+type LocalCache struct {
+	data     map[string][]byte
+	filePath string
+}
+
+func NewLocalCache(cacheDir string) *LocalCache {
+	var fp string
+	if cacheDir != "" {
+		fp = path.Join(cacheDir, "cache.json")
+	}
+	return &LocalCache{filePath: fp, data: map[string][]byte{}}
+}
+
+func (c *LocalCache) useCache() bool {
+	return c.filePath != ""
+}
+
+// Save saves the cache to the file
+func (c *LocalCache) Save() error {
+	buf, err := json.Marshal(c.data)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(c.filePath, buf, 0644)
+}
+
+// Load loads the cache from the file
+func (c *LocalCache) Load() error {
+	buf, err := os.ReadFile(c.filePath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	return json.Unmarshal(buf, &c.data)
+}
+
+func (c *LocalCache) Run(ctx context.Context) {
+	if !c.useCache() {
+		return
+	}
+
+	if err := c.Load(); err != nil {
+		log.Printf("Error loading cache: %+v", err)
+	}
+
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := c.Save(); err != nil {
+					log.Printf("Error saving cache: %+v", err)
+				}
+				log.Printf("Cache saved.")
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+}
+
 type ProxyHandler struct {
-	TargetURL string
+	targetURL string
+	cache     *LocalCache
 }
 
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	target, err := url.Parse(h.TargetURL)
+
+	p := r.URL.Path
+	log.Printf("---")
+	log.Printf("path: %s", p)
+
+	if r.Method == http.MethodGet && h.cache.useCache() {
+		if cached, ok := h.cache.data[p]; ok {
+			log.Printf("==> Cache hit")
+			if _, err := io.Copy(w, bytes.NewReader(cached)); err != nil {
+				e := fmt.Errorf("Error writing response: %+v\n", err)
+				http.Error(w, e.Error(), http.StatusInternalServerError)
+			}
+			return
+		}
+	}
+
+	target, err := url.Parse(h.targetURL)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -45,7 +141,7 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
 		log.Printf("Error forwarding request: %+v", err)
-		http.Error(w, "Error forwarding request.", http.StatusBadRequest)
+		http.Error(w, err.Error(), resp.StatusCode)
 		return
 	}
 	log.Printf("<== status: %v", resp.Status)
@@ -58,10 +154,32 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	_, err = io.Copy(w, resp.Body)
-	if err != nil {
-		http.Error(w, "Error writing response", http.StatusInternalServerError)
+	if r.Method != http.MethodGet && !h.cache.useCache() {
+		if _, err := io.Copy(w, resp.Body); err != nil {
+			e := fmt.Errorf("Error reading response: %+v\n", err)
+			http.Error(w, e.Error(), http.StatusInternalServerError)
+		}
+		return
 	}
+
+	// TODO: Make gzip optional
+	gr, err := gzip.NewReader(io.TeeReader(resp.Body, w))
+	if err != nil {
+		e := fmt.Errorf("Error creating gzip reader: %+v\n", err)
+		http.Error(w, e.Error(), http.StatusInternalServerError)
+		return
+	}
+	defer gr.Close()
+
+	buf := &bytes.Buffer{}
+	if _, err := io.Copy(buf, gr); err != nil {
+		e := fmt.Errorf("Error reading response: %+v\n", err)
+		http.Error(w, e.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	h.cache.data[p] = buf.Bytes()
+
 }
 
 func mustgetenv(name string) string {
