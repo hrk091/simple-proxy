@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -24,6 +25,10 @@ func main() {
 		log.Fatal(err)
 	}
 }
+
+var (
+	debug = os.Getenv("DEBUG") != ""
+)
 
 func run() error {
 	target := mustgetenv("TARGET_URL")
@@ -99,7 +104,9 @@ func (c *LocalCache) Run(ctx context.Context) {
 				if err := c.Save(); err != nil {
 					log.Printf("Error saving cache: %+v", err)
 				}
-				log.Printf("Cache saved.")
+				if debug {
+					log.Printf("Cache saved.")
+				}
 			case <-ctx.Done():
 				return
 			}
@@ -114,7 +121,7 @@ type ProxyHandler struct {
 
 func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
-	p := r.URL.Path
+	p := r.URL.String()
 	log.Printf("---")
 	log.Printf("path: %s", p)
 
@@ -126,6 +133,12 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, e.Error(), http.StatusInternalServerError)
 			}
 			return
+		} else {
+			var keys []string
+			for k := range h.cache.data {
+				keys = append(keys, k)
+			}
+			log.Printf("Cache missed: current keys: %+v", keys)
 		}
 	}
 
@@ -136,7 +149,12 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	rewriteRequestURL(r, target)
 	r.Host = ""
 	r.RequestURI = ""
-	log.Printf("==> %+v", r)
+	// remove If-None-Match and If-Modified-Since to force-fetch when cache missed in proxy
+	r.Header.Del("If-None-Match")
+	r.Header.Del("If-Modified-Since")
+	if debug {
+		log.Printf("==> req[%s]: %+v", p, r)
+	}
 
 	resp, err := http.DefaultClient.Do(r)
 	if err != nil {
@@ -144,7 +162,9 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), resp.StatusCode)
 		return
 	}
-	log.Printf("<== status: %v", resp.Status)
+	if debug {
+		log.Printf("<== resp[%s]: %s, %+v", p, resp.Status, resp)
+	}
 	defer resp.Body.Close()
 
 	for key, values := range resp.Header {
@@ -154,7 +174,7 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	w.WriteHeader(resp.StatusCode)
 
-	if r.Method != http.MethodGet && !h.cache.useCache() {
+	if r.Method != http.MethodGet || !h.cache.useCache() {
 		if _, err := io.Copy(w, resp.Body); err != nil {
 			e := fmt.Errorf("Error reading response: %+v\n", err)
 			http.Error(w, e.Error(), http.StatusInternalServerError)
@@ -163,22 +183,25 @@ func (h *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// TODO: Make gzip optional
+	log.Printf("==> Caching response: %s", p)
 	gr, err := gzip.NewReader(io.TeeReader(resp.Body, w))
-	if err != nil {
-		e := fmt.Errorf("Error creating gzip reader: %+v\n", err)
-		http.Error(w, e.Error(), http.StatusInternalServerError)
+	if errors.Is(err, io.EOF) {
+		log.Printf("<== EOF: %s", p)
+		return
+	} else if err != nil {
+		log.Printf("Error: create gzip reader: %+v", err)
 		return
 	}
 	defer gr.Close()
 
 	buf := &bytes.Buffer{}
 	if _, err := io.Copy(buf, gr); err != nil {
-		e := fmt.Errorf("Error reading response: %+v\n", err)
-		http.Error(w, e.Error(), http.StatusInternalServerError)
+		log.Printf("Error: read response by gzip reader: %+v", err)
 		return
 	}
 
 	h.cache.data[p] = buf.Bytes()
+	log.Printf("<== Cache created: %s", p)
 
 }
 
